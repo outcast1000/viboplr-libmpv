@@ -1,0 +1,47 @@
+ao_coreaudio: wait for the mixability too when changing the physical format
+
+ca_change_physical_format_sync() waits until the stream's physical format
+equals the requested one, using ca_asbd_equals(), which ignores
+kAudioFormatFlagIsNonMixable. On macOS 27 (2026-11-05, Jabra Link 380 USB
+headset, mpv master 9028187538 and dc4b285c93 alike) the device applies the
+sample format at once and the mixability ~300 ms later. So the exclusive
+output's "switch to non-mixable s16" returned at once with the format still
+mixable. init then read a float virtual format, and the late flip to
+non-mixable fired property_listener_cb ("Stream format changed!
+Reloading."). The reload's restore to the original mixable format did the
+same in the other direction. Result: 10 exclusive opens in 7 s, then
+"can't start audio device ([35]...)", and the device was unusable for
+shared output until coreaudiod restarted.
+
+Compare the mixability as well. If the device never applies it, the
+existing 2 s timeout ends the wait and the format counts as set (the
+sample format is what was asked for), rather than being reverted.
+
+Not upstream yet. Drop this patch once mpv waits for the mixability itself.
+
+--- a/audio/out/ao_coreaudio_utils.c
++++ b/audio/out/ao_coreaudio_utils.c
+@@ -510,12 +510,21 @@
+         if (!CHECK_CA_WARN("could not retrieve physical format"))
+             break;
+ 
++        // ca_asbd_equals() ignores kAudioFormatFlagIsNonMixable. On macOS 27
++        // a device can apply the sample format at once and the mixability
++        // ~300 ms later, so without this the wait returns before the change
++        // has landed and the late update reads as an outside format change.
+         format_set = ca_asbd_equals(&change_format, &actual_format);
+-        if (format_set)
++        if (format_set &&
++            (change_format.mFormatFlags & kAudioFormatFlagIsNonMixable) ==
++            (actual_format.mFormatFlags & kAudioFormatFlagIsNonMixable))
+             break;
+ 
+         if (mp_cond_timedwait_until(&sem->cond, &sem->mutex, wait_until)) {
+-            MP_VERBOSE(ao, "reached timeout\n");
++            // A device that never applies the mixability still has the
++            // format we asked for: keep it rather than restoring the old one.
++            MP_VERBOSE(ao, "reached timeout%s\n",
++                       format_set ? " (mixability never changed)" : "");
+             break;
+         }
+     }
