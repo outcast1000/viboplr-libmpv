@@ -42,7 +42,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          # macos-14 runners are refused since 2026-11-05 ("The configuration
+          # 'macos-14-arm64-us-default' is not supported"). Pinned rather than
+          # macos-latest so the build environment doesn't move on its own.
+          - os: macos-15
             platform: macos-aarch64
           - os: windows-latest
             platform: windows-x86_64
