@@ -1,0 +1,261 @@
+name: Build libmpv
+
+# Builds Vibo's trimmed, self-contained libmpv (build.sh, from the pinned
+# sources.txt) for macOS arm64 and Windows x64, proves each one loads and plays
+# by running the app's real-libmpv engine tests against it, and — only when
+# asked — publishes the archives as a release of this repo named after the build
+# (e.g. `vibo-git-dc4b285c93-84dbcf9b`, tagged on the recipe commit that built
+# it). It never re-pins the app: adopting a build is a separate, deliberate edit
+# of scripts/libmpv.lock.json in outcast1000/viboplr.
+#
+# The build name carries the recipe hash (sources.txt + build.sh + patches +
+# mpv_ref), and publishing never overwrites an asset that exists: packaging
+# isn't byte-reproducible, and a released app may already pin the published
+# bytes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the archives as a release named after the build (never overwrites)
+        type: boolean
+        default: false
+      mpv_ref:
+        description: Build this mpv commit instead of the pinned release (full or short sha; `npm run bump` in the app prints it)
+        type: string
+        default: ""
+      app_ref:
+        description: The outcast1000/viboplr ref whose engine tests prove the build
+        type: string
+        default: main
+
+concurrency:
+  group: build-libmpv
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macos-aarch64
+          - os: windows-latest
+            platform: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      # Through the environment, never pasted into a script: build.sh
+      # validates it (hex sha only) before it reaches a URL.
+      MPV_REF: ${{ inputs.mpv_ref }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Only the build tools and the few system libraries the recipe takes from
+      # UCRT64 (zlib, iconv, and spirv-cross for mpv's d3d11 renderer; shaderc
+      # is built from source — UCRT64's static one lacks glslang and
+      # SPIRV-Tools). No other media library may be installed here: the
+      # recipe's pkg-config path includes UCRT64's, so anything present could
+      # be picked up.
+      - if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make diffutils patch zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-libiconv
+            mingw-w64-ucrt-x86_64-spirv-cross
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          LIBMPV_WORK: ${{ runner.temp }}/libmpv-build
+        run: ./build.sh build
+
+      - name: Build (Windows, MSYS2 UCRT64)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          # The DLL must carry libstdc++ itself. --prefer-static already steers
+          # meson to the archive; hiding the import library on this throwaway
+          # runner makes linking the runtime DLL impossible rather than unlikely.
+          mv "$MINGW_PREFIX/lib/libstdc++.dll.a" "$MINGW_PREFIX/lib/libstdc++.dll.a.hidden"
+          export LIBMPV_WORK="$(cygpath -u '${{ runner.temp }}')/libmpv-build"
+          ./build.sh build
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libmpv-${{ matrix.platform }}
+          path: ${{ runner.temp }}/libmpv-build/out/
+          if-no-files-found: error
+
+      # The logs are what you need when a configure step fails.
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/libmpv-build/src/**/configure.log
+            ${{ runner.temp }}/libmpv-build/src/**/config.log
+            ${{ runner.temp }}/libmpv-build/src/**/meson-logs/meson-log.txt
+            ${{ runner.temp }}/libmpv-build/src/mpv/_b/*.rsp
+            ${{ runner.temp }}/libmpv-build/prefix/lib/pkgconfig/*.pc
+            ${{ runner.temp }}/libmpv-build/shaderc-*.log
+          if-no-files-found: ignore
+
+  # The app's own engine suite is the proof a build works: it is what the app
+  # will run against it. It lives in outcast1000/viboplr, so it is checked out
+  # at `app_ref` and run with VIBOPLR_LIBMPV_PATH pointing at this run's build.
+  engine-test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos-aarch64
+            lib: libmpv/libmpv.2.dylib
+          - os: windows-latest
+            platform: windows-x86_64
+            lib: libmpv-2.dll
+    runs-on: ${{ matrix.os }}
+    outputs:
+      app_sha: ${{ steps.app.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: outcast1000/viboplr
+          ref: ${{ inputs.app_ref }}
+          path: app
+
+      - id: app
+        shell: bash
+        working-directory: app
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      # Only for the build: tauri-build refuses to compile without the files the
+      # per-platform bundle config lists (the app's pinned libmpv). The tests
+      # below load THIS run's library instead — VIBOPLR_LIBMPV_PATH outranks the
+      # vendored copy, and the test step fails unless the suite reports it
+      # loaded from there.
+      - name: Vendor the app's pinned libmpv (build prerequisite)
+        working-directory: app
+        run: node scripts/fetch-libmpv.mjs
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: libmpv-${{ matrix.platform }}
+          path: ${{ runner.temp }}/libmpv
+
+      - name: Unpack
+        shell: bash
+        working-directory: ${{ runner.temp }}/libmpv
+        run: |
+          unzip -q -o ./*.zip
+          ls -la
+          cat ./*.json
+
+      # The engine tests skip themselves when libmpv is absent — here that
+      # would be a pass that proves nothing, so a skip fails the job.
+      - name: Engine tests (this libmpv)
+        shell: bash
+        working-directory: app/src-tauri
+        env:
+          VIBOPLR_LIBMPV_PATH: ${{ runner.temp }}/libmpv/${{ matrix.lib }}
+        run: |
+          set -o pipefail
+          cargo test --lib mpv_engine -- --nocapture 2>&1 | tee engine-test.log
+          if grep -q "\[engine-test\] SKIPPED" engine-test.log; then
+            echo "::error::engine tests were skipped — libmpv did not load"
+            exit 1
+          fi
+          if ! grep -q "^\[engine-test\] libmpv: .* (env)$" engine-test.log; then
+            echo "::error::the suite did not run against this build (VIBOPLR_LIBMPV_PATH)"
+            grep "^\[engine-test\] libmpv:" engine-test.log || true
+            exit 1
+          fi
+          grep "^\[engine-test\] libmpv:" engine-test.log
+
+  publish:
+    needs: engine-test
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: libmpv-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the build as a release (never overwrites)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          APP_SHA: ${{ needs.engine-test.outputs.app_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Every platform of one run shares the recipe hash, so they share the
+          # build name: libmpv-<build>-<platform>.zip.
+          builds=$(for j in dist/*.json; do jq -r .name "$j" | sed -E 's/^libmpv-(.*)-(macos|windows)-[a-z0-9_]+\.zip$/\1/'; done | sort -u)
+          if [ "$(wc -l <<< "$builds")" != 1 ]; then
+            echo "::error::the platforms disagree on the build name: $builds"
+            exit 1
+          fi
+          build=$builds
+
+          if ! gh release view "$build" --repo "$REPO" >/dev/null 2>&1; then
+            {
+              echo "Built by $RUN_URL from recipe commit \`$GITHUB_SHA\`."
+              echo
+              echo "Engine tests: outcast1000/viboplr@\`$APP_SHA\`, macOS + Windows."
+              echo
+              echo "| archive | sha256 |"
+              echo "|---|---|"
+              for j in dist/*.json; do echo "| \`$(jq -r .name "$j")\` | \`$(jq -r .sha256 "$j")\` |"; done
+              echo
+              echo "Adopting it is a hand re-pin of \`scripts/libmpv.lock.json\` in the app (url, sha256, mpvGitHash, build)."
+            } > notes.md
+            gh release create "$build" --repo "$REPO" --target "$GITHUB_SHA" \
+              --title "$build" --notes-file notes.md --latest=false
+          fi
+
+          existing=$(gh release view "$build" --repo "$REPO" --json assets --jq '.assets[].name')
+          echo "## $build" >> "$GITHUB_STEP_SUMMARY"
+          for j in dist/*.json; do
+            zip="dist/$(jq -r .name "$j")"
+            name=$(basename "$zip")
+            if grep -qxF "$name" <<< "$existing"; then
+              # Same recipe, different bytes: the published copy stands.
+              echo "::notice::$name is already published — left as is"
+              echo "- \`$name\` — already published, this run's build was not uploaded" >> "$GITHUB_STEP_SUMMARY"
+            else
+              gh release upload "$build" "$zip" "$j" --repo "$REPO"
+              echo "- \`$name\` — sha256 \`$(jq -r .sha256 "$j")\`" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
