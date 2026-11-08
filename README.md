@@ -22,7 +22,7 @@ gh workflow run build-libmpv.yml --repo outcast1000/viboplr-libmpv -f publish=tr
 gh run list --workflow build-libmpv.yml --repo outcast1000/viboplr-libmpv
 ```
 
-- `mpv_ref`: build this mpv commit instead of the release in `sources.txt`. The app's `npm run bump` prints the command with mpv master's head filled in when master is ahead of the pin.
+- `mpv_ref`: build this mpv commit instead of the release in `sources.txt`. The app's `npm run bump` prints the command with mpv master's head filled in when master is ahead of the pin, and says when a published build isn't adopted yet.
 - `app_ref` (default `main`): the `outcast1000/viboplr` ref whose engine tests (`cargo test --lib mpv_engine`) must pass against the new build. A skipped suite, or one that loaded any other libmpv, fails the run.
 - `publish`: publish the archives as a release named after the build, e.g. `vibo-git-dc4b285c93-84dbcf9b`, tagged on the commit that built it. An asset that already exists is never overwritten, because a released app may already pin those bytes.
 
@@ -30,13 +30,13 @@ The build name is `vibo-<mpv version or git-<sha>>-<recipe>`. `<recipe>` is the 
 
 ## Adopting a build in the app
 
-Nothing here changes the app. In `outcast1000/viboplr`, re-pin each platform in `scripts/libmpv.lock.json` by hand (`url`, `upstream`, `sha256`, `mpvGitHash`, `build`) from the release's assets, then:
+Nothing here changes the app. In `outcast1000/viboplr`:
 
 ```sh
-node scripts/fetch-libmpv.mjs && (cd src-tauri && cargo test --lib)
+npm run libmpv:adopt -- <build>   # omit <build> for the newest published one
 ```
 
-Test playback on both platforms before you commit the lock. The next app release ships it.
+It reads the release's build-info JSON for each platform, checks each archive against GitHub's recorded sha256, re-pins `scripts/libmpv.lock.json`, vendors the build, and repackages and publishes the app's downloadable engine component from it. It doesn't commit. Test playback on both platforms, then commit `scripts/libmpv.lock.json` and `src-tauri/engine-component.lock.json`. The next app release ships it.
 
 Builds published before this repo existed stay on the app repo's `vendor-libmpv` release, which released apps pin. Don't move or delete them.
 

@@ -5,8 +5,8 @@ name: Build libmpv
 # by running the app's real-libmpv engine tests against it, and — only when
 # asked — publishes the archives as a release of this repo named after the build
 # (e.g. `vibo-git-dc4b285c93-84dbcf9b`, tagged on the recipe commit that built
-# it). It never re-pins the app: adopting a build is a separate, deliberate edit
-# of scripts/libmpv.lock.json in outcast1000/viboplr.
+# it). It never re-pins the app: adopting a build is a separate, deliberate step
+# in outcast1000/viboplr (`npm run libmpv:adopt -- <build>`).
 #
 # The build name carries the recipe hash (sources.txt + build.sh + patches +
 # mpv_ref), and publishing never overwrites an asset that exists: packaging
@@ -242,7 +242,7 @@ jobs:
               echo "|---|---|"
               for j in dist/*.json; do echo "| \`$(jq -r .name "$j")\` | \`$(jq -r .sha256 "$j")\` |"; done
               echo
-              echo "Adopting it is a hand re-pin of \`scripts/libmpv.lock.json\` in the app (url, sha256, mpvGitHash, build)."
+              echo "Adopt it in the app with \`npm run libmpv:adopt -- $build\` (re-pins \`scripts/libmpv.lock.json\`, vendors it and republishes the engine component), then play-test it on both platforms before committing."
             } > notes.md
             gh release create "$build" --repo "$REPO" --target "$GITHUB_SHA" \
               --title "$build" --notes-file notes.md --latest=false
